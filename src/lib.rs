@@ -28,12 +28,25 @@ use uuid::Uuid;
 const MAX_IO_RECORDS: usize = 2000;
 const MAX_RAW_BYTES: usize = 1024 * 1024; // 1 MiB per stream buffer
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentProfile {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: IpAddr,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_agent_name")]
+    pub default_agent: String,
+    #[serde(default)]
+    pub agents: HashMap<String, AgentProfile>,
 }
 
 fn default_host() -> IpAddr {
@@ -44,11 +57,17 @@ fn default_port() -> u16 {
     3000
 }
 
+fn default_agent_name() -> String {
+    "claude".to_string()
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: default_host(),
             port: default_port(),
+            default_agent: default_agent_name(),
+            agents: HashMap::new(),
         }
     }
 }
@@ -57,6 +76,7 @@ impl Default for ServerConfig {
 struct SectionConfig {
     host: Option<IpAddr>,
     port: Option<u16>,
+    agent: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,6 +85,9 @@ struct FileConfig {
     default: SectionConfig,
     host: Option<IpAddr>,
     port: Option<u16>,
+    agent: Option<String>,
+    #[serde(default)]
+    agents: HashMap<String, AgentProfile>,
 }
 
 impl FileConfig {
@@ -74,6 +97,10 @@ impl FileConfig {
 
     fn resolved_port(&self) -> Option<u16> {
         self.default.port.or(self.port)
+    }
+
+    fn resolved_agent(&self) -> Option<String> {
+        self.default.agent.clone().or_else(|| self.agent.clone())
     }
 }
 
@@ -95,6 +122,7 @@ impl ServerConfig {
             "Options:\n",
             "  -p, --port <PORT>      Port number to listen on (default: 3000, env: AGENT_GATEWAY_PORT / PORT)\n",
             "  -H, --host <HOST>      Host IP to bind (default: 0.0.0.0, env: AGENT_GATEWAY_HOST / HOST)\n",
+            "  -a, --agent <AGENT>    Default agent name/command (default: claude, env: AGENT_GATEWAY_DEFAULT_AGENT)\n",
             "  -c, --config <PATH>    Path to TOML config file (default: ~/.config/agent-gateway/config.toml on Mac/Linux, %USERPROFILE%\\.config\\agent-gateway\\config.toml on Windows)\n",
             "  -h, --help             Print help\n",
             "  -V, --version          Print version\n"
@@ -133,6 +161,7 @@ impl ServerConfig {
 
         let mut cli_port: Option<u16> = None;
         let mut cli_host: Option<IpAddr> = None;
+        let mut cli_agent: Option<String> = None;
         let mut cli_config: Option<PathBuf> = None;
 
         while let Some(arg) = iter.next() {
@@ -177,6 +206,16 @@ impl ServerConfig {
                             .map_err(|_| format!("invalid host IP address: '{val}'"))?,
                     );
                 }
+                "-a" | "--agent" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --agent".to_string())?;
+                    cli_agent = Some(val);
+                }
+                _ if arg.starts_with("--agent=") => {
+                    let val = &arg["--agent=".len()..];
+                    cli_agent = Some(val.to_string());
+                }
                 "-c" | "--config" => {
                     let val = iter
                         .next()
@@ -217,6 +256,9 @@ impl ServerConfig {
             })
             .transpose()?;
 
+        let env_agent = env_lookup("AGENT_GATEWAY_DEFAULT_AGENT")
+            .or_else(|| env_lookup("AGENT_GATEWAY_AGENT"));
+
         let cfg = ServerConfig {
             host: cli_host
                 .or(env_host)
@@ -226,6 +268,11 @@ impl ServerConfig {
                 .or(env_port)
                 .or_else(|| file_cfg.resolved_port())
                 .unwrap_or_else(default_port),
+            default_agent: cli_agent
+                .or(env_agent)
+                .or_else(|| file_cfg.resolved_agent())
+                .unwrap_or_else(default_agent_name),
+            agents: file_cfg.agents,
         };
 
         Ok(CliOutcome::Run(cfg))
@@ -274,6 +321,7 @@ pub enum AgentStatus {
 pub struct AgentSummary {
     pub id: Uuid,
     pub name: String,
+    pub agent: String,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -290,18 +338,23 @@ struct IoBuffer {
     records: VecDeque<IoRecord>,
     stdin_raw: VecDeque<u8>,
     stdout_raw: VecDeque<u8>,
+    vt_parser: vt100::Parser,
 }
 
 impl IoBuffer {
-    fn new() -> Self {
+    fn new(rows: u16, cols: u16) -> Self {
         Self {
             records: VecDeque::new(),
             stdin_raw: VecDeque::new(),
             stdout_raw: VecDeque::new(),
+            vt_parser: vt100::Parser::new(rows, cols, 1000),
         }
     }
 
     fn push(&mut self, record: IoRecord, raw: &[u8]) {
+        if record.stream == StreamKind::Stdout {
+            self.vt_parser.process(raw);
+        }
         let target = match record.stream {
             StreamKind::Stdin => &mut self.stdin_raw,
             StreamKind::Stdout => &mut self.stdout_raw,
@@ -317,6 +370,10 @@ impl IoBuffer {
         }
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.vt_parser.set_size(rows, cols);
+    }
+
     fn stdin_string(&self) -> String {
         let bytes: Vec<u8> = self.stdin_raw.iter().copied().collect();
         String::from_utf8_lossy(&bytes).into_owned()
@@ -325,6 +382,11 @@ impl IoBuffer {
     fn stdout_string(&self) -> String {
         let bytes: Vec<u8> = self.stdout_raw.iter().copied().collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn screen_contents(&self) -> (String, (u16, u16)) {
+        let screen = self.vt_parser.screen();
+        (screen.contents(), screen.cursor_position())
     }
 }
 
@@ -383,6 +445,9 @@ impl AgentSession {
                 })
                 .map_err(|e| format!("failed to resize pty: {e}"))?;
         }
+        if let Ok(mut buf) = self.io_buffer.lock() {
+            buf.resize(rows, cols);
+        }
         let mut meta = self.meta.write().await;
         meta.rows = rows;
         meta.cols = cols;
@@ -397,14 +462,23 @@ impl AgentSession {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AgentManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<AgentSession>>>>,
+    default_agent: String,
+    agent_profiles: Arc<HashMap<String, AgentProfile>>,
 }
 
-#[derive(Debug, Deserialize)]
+impl Default for AgentManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct SpawnAgentRequest {
-    pub command: String,
+    pub agent: Option<String>,
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     pub name: Option<String>,
@@ -439,9 +513,22 @@ pub struct IoQuery {
 pub struct AgentIoResponse {
     pub id: Uuid,
     pub status: AgentStatus,
+    pub screen: String,
     pub stdin: String,
     pub stdout: String,
     pub records: Vec<IoRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgentScreenResponse {
+    pub id: Uuid,
+    pub status: AgentStatus,
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub seq: u64,
+    pub screen: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,13 +561,63 @@ enum WsServerMessage {
 
 impl AgentManager {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_agent: default_agent_name(),
+            agent_profiles: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_config(config: &ServerConfig) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            default_agent: config.default_agent.clone(),
+            agent_profiles: Arc::new(config.agents.clone()),
+        }
+    }
+
+    pub fn default_agent(&self) -> &str {
+        &self.default_agent
+    }
+
+    fn resolve_agent_spec(
+        &self,
+        req: &SpawnAgentRequest,
+    ) -> Result<(String, String, Vec<String>, HashMap<String, String>), String> {
+        let agent_name = match (&req.agent, &req.command) {
+            (Some(a), _) => a.trim().to_string(),
+            (None, Some(c)) => c.trim().to_string(),
+            (None, None) => self.default_agent.trim().to_string(),
+        };
+
+        if agent_name.is_empty() {
+            return Err("agent or command must not be empty".to_string());
+        }
+
+        let mut env = HashMap::new();
+        let (command, args) = if let Some(explicit_cmd) = &req.command {
+            let trimmed = explicit_cmd.trim();
+            if trimmed.is_empty() {
+                return Err("command must not be empty".to_string());
+            }
+            (trimmed.to_string(), req.args.clone())
+        } else if let Some(profile) = self.agent_profiles.get(&agent_name) {
+            env.extend(profile.env.clone());
+            let mut merged_args = profile.args.clone();
+            merged_args.extend(req.args.clone());
+            (profile.command.clone(), merged_args)
+        } else {
+            (agent_name.clone(), req.args.clone())
+        };
+
+        env.extend(req.env.clone());
+        Ok((agent_name, command, args, env))
     }
 
     pub async fn spawn(&self, req: SpawnAgentRequest) -> Result<AgentSummary, String> {
-        if req.command.trim().is_empty() {
-            return Err("command must not be empty".to_string());
-        }
+        let (agent_name, raw_command, args, env) = self.resolve_agent_spec(&req)?;
+        let augmented_path = build_augmented_path(env.get("PATH").map(String::as_str));
+        let resolved_command = resolve_executable(&raw_command, &augmented_path);
 
         let rows = req.rows.unwrap_or(24);
         let cols = req.cols.unwrap_or(80);
@@ -494,22 +631,27 @@ impl AgentManager {
             })
             .map_err(|e| format!("failed to open pty: {e}"))?;
 
-        let mut cmd = CommandBuilder::new(&req.command);
-        cmd.args(&req.args);
+        let mut cmd = CommandBuilder::new(&resolved_command);
+        cmd.args(&args);
         if let Some(ref cwd) = req.cwd {
             cmd.cwd(cwd);
         }
-        if !req.env.contains_key("TERM") {
+        if !env.contains_key("TERM") {
             cmd.env("TERM", "xterm-256color");
         }
-        for (k, v) in &req.env {
+        if !env.contains_key("PATH") {
+            if let Some(ref path_val) = augmented_path {
+                cmd.env("PATH", path_val);
+            }
+        }
+        for (k, v) in &env {
             cmd.env(k, v);
         }
 
         let mut child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| format!("failed to spawn command '{}': {e}", req.command))?;
+            .map_err(|e| format!("failed to spawn agent '{}' (command '{}'): {e}", agent_name, resolved_command))?;
         drop(pair.slave);
 
         let pid = child.process_id();
@@ -524,12 +666,13 @@ impl AgentManager {
             .map_err(|e| format!("failed to take pty writer: {e}"))?;
 
         let id = Uuid::new_v4();
-        let name = req.name.unwrap_or_else(|| req.command.clone());
+        let name = req.name.unwrap_or_else(|| agent_name.clone());
         let summary = AgentSummary {
             id,
             name,
-            command: req.command,
-            args: req.args,
+            agent: agent_name,
+            command: resolved_command,
+            args,
             cwd: req.cwd,
             pid,
             status: AgentStatus::Running,
@@ -543,7 +686,7 @@ impl AgentManager {
         let (tx, _) = broadcast::channel(1024);
         let session = Arc::new(AgentSession {
             meta: RwLock::new(summary.clone()),
-            io_buffer: Mutex::new(IoBuffer::new()),
+            io_buffer: Mutex::new(IoBuffer::new(rows, cols)),
             next_seq: AtomicU64::new(0),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
@@ -617,11 +760,65 @@ pub fn app(manager: AgentManager) -> Router {
         .route("/health", get(health))
         .route("/agents", get(list_agents).post(spawn_agent))
         .route("/agents/:id", get(get_agent).delete(stop_agent))
+        .route("/agents/:id/stop", post(stop_agent))
+        .route("/agents/:id/screen", get(get_agent_screen))
         .route("/agents/:id/io", get(get_agent_io))
         .route("/agents/:id/input", post(send_agent_input))
         .route("/agents/:id/resize", post(resize_agent_pty))
         .route("/agents/:id/ws", get(ws_agent))
         .with_state(manager)
+}
+
+fn build_augmented_path(explicit_path: Option<&str>) -> Option<String> {
+    let base = explicit_path
+        .map(String::from)
+        .or_else(|| std::env::var("PATH").ok());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok();
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(ref h) = home {
+        let h_path = PathBuf::from(h);
+        for rel in [
+            ".local/share/mise/shims",
+            ".bun/bin",
+            ".local/bin",
+            ".cargo/bin",
+        ] {
+            let candidate = h_path.join(rel);
+            if candidate.is_dir() {
+                dirs.push(candidate);
+            }
+        }
+    }
+    if let Some(ref b) = base {
+        for p in std::env::split_paths(b) {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    std::env::join_paths(dirs)
+        .ok()
+        .and_then(|os| os.into_string().ok())
+        .or(base)
+}
+
+fn resolve_executable(command: &str, search_path: &Option<String>) -> String {
+    let cmd_path = FsPath::new(command);
+    if cmd_path.components().count() > 1 {
+        return command.to_string();
+    }
+    if let Some(ref path_str) = search_path {
+        for dir in std::env::split_paths(path_str) {
+            let candidate = dir.join(command);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    command.to_string()
 }
 
 #[derive(Serialize)]
@@ -670,6 +867,36 @@ async fn get_agent(
     }
 }
 
+async fn get_agent_screen(
+    State(manager): State<AgentManager>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let Some(session) = manager.get(id).await else {
+        return error_response(StatusCode::NOT_FOUND, "agent not found");
+    };
+
+    let summary = session.summary().await;
+    let seq = session.next_seq.load(Ordering::SeqCst);
+    let (screen, (cursor_row, cursor_col)) = {
+        let Ok(buf) = session.io_buffer.lock() else {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "io buffer lock poisoned");
+        };
+        buf.screen_contents()
+    };
+
+    Json(AgentScreenResponse {
+        id: summary.id,
+        status: summary.status,
+        rows: summary.rows,
+        cols: summary.cols,
+        cursor_row,
+        cursor_col,
+        seq,
+        screen,
+    })
+    .into_response()
+}
+
 async fn get_agent_io(
     State(manager): State<AgentManager>,
     Path(id): Path<Uuid>,
@@ -680,7 +907,7 @@ async fn get_agent_io(
     };
 
     let summary = session.summary().await;
-    let (stdin, stdout, records) = {
+    let (screen, stdin, stdout, records) = {
         let Ok(buf) = session.io_buffer.lock() else {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, "io buffer lock poisoned");
         };
@@ -698,12 +925,14 @@ async fn get_agent_io(
                 filtered = filtered.split_off(filtered.len() - limit);
             }
         }
-        (buf.stdin_string(), buf.stdout_string(), filtered)
+        let (screen, _) = buf.screen_contents();
+        (screen, buf.stdin_string(), buf.stdout_string(), filtered)
     };
 
     Json(AgentIoResponse {
         id: summary.id,
         status: summary.status,
+        screen,
         stdin,
         stdout,
         records,

@@ -48,16 +48,25 @@ Each entry contains `id` (UUID), `name`, `command`, `args`, `cwd`, `pid`, `statu
 
 ### Spawn an agent in a PTY (`POST /agents`)
 
-Always set a descriptive `name` and explicit `cwd` so multiple agents can be distinguished easily:
+Pass `"agent"` (`"claude"`, `"codex"`, `"copilot"`, `"gemini"`, etc.) to explicitly select the agent, or omit `"agent"` to launch the gateway's configured default agent (`[default] agent` in `config.toml`, default `"claude"`):
 
 ```bash
-curl -s -X POST http://localhost:3000/agents \
+# Spawn using the default agent configured in config.toml
+curl -s -X POST "${GATEWAY_URL}/agents" \
   -H "Content-Type: application/json" \
   -d '{
+    "name": "default-worker",
+    "cwd": "/path/to/repo"
+  }' | jq .
+
+# Explicitly specify the agent to launch
+curl -s -X POST "${GATEWAY_URL}/agents" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent": "codex",
     "name": "reviewer-codex",
-    "command": "codex",
-    "args": [],
     "cwd": "/path/to/repo",
+    "args": [],
     "env": {},
     "rows": 36,
     "cols": 120
@@ -66,39 +75,58 @@ curl -s -X POST http://localhost:3000/agents \
 
 Save the returned `.id` (UUID) for subsequent operations.
 
-### Read `stdin` and `stdout` (`GET /agents/:id/io`)
+### Read the current rendered terminal screen (`GET /agents/:id/screen`) — **Preferred for AI judgment**
 
-Returns both cumulative raw buffers (`stdin`, `stdout`) and sequenced `records` (`seq`, `timestamp`, `stream`, `data`).
+Because interactive TUIs (Claude Code, Copilot CLI, Codex, Gemini CLI) emit tens of kilobytes of raw ANSI cursor/color codes, **always prefer `GET /agents/:id/screen`** to inspect what is currently displayed on the terminal screen. It uses a `vt100` virtual terminal emulator to return clean, ANSI-free plain text and cursor coordinates:
 
 ```bash
-# Full snapshot
-curl -s "http://localhost:3000/agents/${AGENT_ID}/io" | jq .
-
-# Read only new stdout chunks since a known sequence number
-curl -s "http://localhost:3000/agents/${AGENT_ID}/io?stream=stdout&since_seq=${LAST_SEQ}" | jq .
-
-# Read only the latest 20 records
-curl -s "http://localhost:3000/agents/${AGENT_ID}/io?limit=20" | jq .
+curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/screen" | jq -r '.screen'
 ```
 
-**Tip for Incremental Polling**:
-Record the highest `.records[].seq` value from each response and pass it as `since_seq` on the next request to avoid re-reading entire terminal transcripts.
+### Read raw `stdin` and `stdout` history (`GET /agents/:id/io`)
+
+Returns `.screen` (rendered screen), cumulative raw buffers (`stdin`, `stdout`), and sequenced `records` (`seq`, `timestamp`, `stream`, `data`).
+
+```bash
+# Read only new stdout chunks since a known sequence number
+curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/io?stream=stdout&since_seq=${LAST_SEQ}" | jq .
+
+# Read only the latest 20 records
+curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/io?limit=20" | jq .
+```
 
 ### Send input to `stdin` (`POST /agents/:id/input`)
 
 Writes raw text/control sequences to the agent's PTY master.
 
 ```bash
-# Send a line + Enter
-curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/input" \
+# Send a prompt + Enter (\r)
+curl -s -X POST "${GATEWAY_URL}/agents/${AGENT_ID}/input" \
   -H "Content-Type: application/json" \
-  -d '{"data": "Please review src/lib.rs\n"}' | jq .
+  -d '{"data": "Please review src/lib.rs\r"}' | jq .
 ```
 
-**PTY Input Notes**:
-- Interactive shells and line-oriented prompts expect `\n` (or `\r`) at the end of `data` to submit.
-- TUI applications (such as Claude Code, Codex TUI, or Copilot CLI) in raw mode often treat `\r` as Enter, `\u001b` as `Esc`, and `\u0003` as `Ctrl+C`.
-- Returns `409 Conflict` if the target agent has already exited.
+**PTY Key & Control Sequence Reference**:
+- `Enter` (submit / confirm selection): `\r` (preferred for raw-mode TUIs) or `\n`
+- `Down arrow`: `\u001b[B`
+- `Up arrow`: `\u001b[A`
+- `Escape`: `\u001b`
+- `Ctrl+C`: `\u0003`
+- `Tab`: `\t` / `Shift+Tab`: `\u001b[Z`
+
+### Autonomous Dialog & Prompt Resolution Loop
+
+After spawning an agent (`POST /agents`) or sending a prompt (`POST /agents/:id/input`), **always inspect `GET /agents/:id/screen`** after 1–3 seconds and judge the screen state before proceeding:
+
+1. **Workspace / Folder Trust Dialogs** (safe to auto-confirm when working in the requested project directory):
+   - **Copilot CLI**: Shows `Confirm folder trust` with `❯ 1. Yes` selected by default → send `{"data": "\r"}` to confirm and advance.
+   - **Claude Code**: Shows `Quick safety check: Is this a project you created or one you trust?` with `❯ No, exit` on the first line and `Yes, I trust this folder` on the second line → send `{"data": "\u001b[B\r"}` (Down arrow + Enter) to select "Yes, I trust this folder".
+   - **Codex / Gemini CLI**: If a trust/approval menu appears, inspect which line has the cursor (`❯` or `>`) and send arrow keys + `\r` (or `y\r`) accordingly.
+2. **Wait until Ready Prompt**:
+   - Confirm via `GET /agents/:id/screen` that the TUI has reached its main input prompt (e.g. `❯`) before sending the task prompt.
+3. **Tool / Command Approval Prompts during Execution**:
+   - While the spawned agent is working, periodically check `GET /agents/:id/screen`.
+   - If the spawned agent pauses at a confirmation prompt (e.g., asking to run a safe read/test command or file edit within the target workspace), evaluate whether the action is safe and within the user's requested scope. If safe, send the confirmation key (`\r` or `y\r`). If destructive or outside scope, stop and ask the user.
 
 ### Resize the PTY (`POST /agents/:id/resize`)
 
@@ -110,12 +138,12 @@ curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/resize" \
   -d '{"rows": 45, "cols": 140}' | jq .
 ```
 
-### Stop an agent (`DELETE /agents/:id`)
+### Stop an agent (`POST /agents/:id/stop` or `DELETE /agents/:id`)
 
 Terminates the process and marks its status as `exited`:
 
 ```bash
-curl -s -X DELETE "http://localhost:3000/agents/${AGENT_ID}" | jq .
+curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/stop" | jq .
 ```
 
 ### Real-time WebSocket stream (`GET /agents/:id/ws`)

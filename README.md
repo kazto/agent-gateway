@@ -34,8 +34,18 @@ AGENT_GATEWAY_PORT=4000 AGENT_GATEWAY_HOST=127.0.0.1 ./target/release/agent-gate
 [default]
 port = 12345
 host = "127.0.0.1"
+agent = "claude" # POST /agents で agent 未指定時に使われるデフォルトエージェント
+
+# 必要に応じてエージェントごとのコマンド・引数を定義可能（未定義でも PATH / mise / bun / cargo から自動解決）
+[agents.claude]
+command = "claude"
+args = []
+
+[agents.codex]
+command = "codex"
+args = []
 ```
-優先順位は **CLIオプション (`-p`/`--port`, `-H`/`--host`) > 環境変数 (`AGENT_GATEWAY_PORT`/`PORT`) > 設定ファイル (`config.toml`) > デフォルト (`0.0.0.0:3000`)** です。
+優先順位は **CLIオプション (`-p`/`--port`, `-H`/`--host`, `-a`/`--agent`) > 環境変数 (`AGENT_GATEWAY_PORT`/`PORT`, `AGENT_GATEWAY_DEFAULT_AGENT`) > 設定ファイル (`config.toml`) > デフォルト (`0.0.0.0:3000`, `agent = "claude"`)** です。
 
 ## systemd によるログイン時自動起動 (`systemctl --user`)
 
@@ -68,15 +78,22 @@ journalctl --user -u agent-gateway.service -f
 ### 1. エージェントの起動 (`POST /agents`)
 
 ```bash
+# デフォルトエージェント（config.toml の [default] agent）で起動
 curl -X POST http://localhost:3000/agents \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "claude-agent",
-    "command": "claude",
-    "args": [],
+    "cwd": "/path/to/workspace"
+  }'
+
+# エージェント種別（claude / codex / copilot / gemini など）を明示して起動
+curl -X POST http://localhost:3000/agents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent": "codex",
+    "name": "codex-reviewer",
     "cwd": "/path/to/workspace",
-    "rows": 24,
-    "cols": 80
+    "rows": 30,
+    "cols": 100
   }'
 ```
 
@@ -90,25 +107,33 @@ curl http://localhost:3000/agents
 curl "http://localhost:3000/agents?status=all"
 ```
 
-### 3. エージェントの標準入力・標準出力を取得 (`GET /agents/:id/io`)
+### 3. 現在のターミナル画面スナップショットの取得 (`GET /agents/:id/screen`)
+
+ANSIエスケープシーケンス（カーソル移動・色コード等）を `vt100` で解釈し、**今画面に表示されているプレーンテキスト**とカーソル位置を軽量に取得します。呼び出し側のAIエージェントが画面状態（フォルダ信頼確認、ツール実行承認、入力待ちなど）を判断するのに最適です。
 
 ```bash
-# 累積された stdin / stdout 文字列と時系列レコードを取得
+curl http://localhost:3000/agents/<id>/screen
+```
+
+### 4. エージェントの標準入力・標準出力を取得 (`GET /agents/:id/io`)
+
+```bash
+# 描画済み画面 (screen) + 累積された生 stdin / stdout 文字列と時系列レコードを取得
 curl http://localhost:3000/agents/<id>/io
 
 # クエリパラメータによる絞り込み（stream=stdin|stdout, since_seq, limit）
 curl "http://localhost:3000/agents/<id>/io?stream=stdout&since_seq=10&limit=50"
 ```
 
-### 4. 標準入力への送信 (`POST /agents/:id/input`)
+### 5. 標準入力への送信 (`POST /agents/:id/input`)
 
 ```bash
 curl -X POST http://localhost:3000/agents/<id>/input \
   -H "Content-Type: application/json" \
-  -d '{"data": "hello\n"}'
+  -d '{"data": "hello\r"}'
 ```
 
-### 5. PTYウィンドウサイズの変更 (`POST /agents/:id/resize`)
+### 6. PTYウィンドウサイズの変更 (`POST /agents/:id/resize`)
 
 ```bash
 curl -X POST http://localhost:3000/agents/<id>/resize \
@@ -116,13 +141,13 @@ curl -X POST http://localhost:3000/agents/<id>/resize \
   -d '{"rows": 40, "cols": 120}'
 ```
 
-### 6. エージェントの停止 (`DELETE /agents/:id`)
+### 7. エージェントの停止 (`POST /agents/:id/stop` または `DELETE /agents/:id`)
 
 ```bash
-curl -X DELETE http://localhost:3000/agents/<id>
+curl -X POST http://localhost:3000/agents/<id>/stop
 ```
 
-### 7. WebSocketによるリアルタイム双方向ストリーム (`GET /agents/:id/ws`)
+### 8. WebSocketによるリアルタイム双方向ストリーム (`GET /agents/:id/ws`)
 
 - 接続時に既存の入出力履歴とステータスを送信し、以降の `stdin` / `stdout` イベントをリアルタイム配信します。
 - クライアントからは以下のJSONまたは生テキスト・バイナリを送信して操作できます:

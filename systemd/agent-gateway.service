@@ -7,7 +7,7 @@ Type=simple
 ExecStart=%h/.cargo/bin/agent-gateway
 Restart=on-failure
 RestartSec=3
-Environment="PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=%h/.local/share/mise/shims:%h/.bun/bin:%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=agent_gateway=info"
 
 [Install]

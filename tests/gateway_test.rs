@@ -79,6 +79,18 @@ async fn test_agent_lifecycle_and_io() {
     let io_resp = io_resp.expect("expected REPLY:hello-gateway in stdout");
     assert!(io_resp.stdin.contains("hello-gateway\n"));
     assert!(io_resp.stdout.contains("REPLY:hello-gateway"));
+    assert!(io_resp.screen.contains("REPLY:hello-gateway"));
+
+    // Verify GET /agents/:id/screen endpoint
+    let screen_resp: agent_gateway::AgentScreenResponse = client
+        .get(format!("{base_url}/agents/{}/screen", created.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(screen_resp.screen.contains("REPLY:hello-gateway"));
 
     // 4. Resize PTY
     let resize_resp = client
@@ -180,13 +192,15 @@ fn test_config_port_and_host_resolution() {
     use agent_gateway::{CliOutcome, ServerConfig};
     use std::collections::HashMap;
 
-    // 1. Default values (0.0.0.0:3000) when no HOME/USER_PROFILE has a config
+    // 1. Default values (0.0.0.0:3000, default_agent = "claude") when no HOME/USER_PROFILE has a config
     let outcome = ServerConfig::from_args_and_env(["agent-gateway"], |_| None).unwrap();
     assert_eq!(
         outcome,
         CliOutcome::Run(ServerConfig {
             host: "0.0.0.0".parse().unwrap(),
             port: 3000,
+            default_agent: "claude".to_string(),
+            agents: HashMap::new(),
         })
     );
 
@@ -197,7 +211,7 @@ fn test_config_port_and_host_resolution() {
     let default_cfg_path = cfg_dir.join("config.toml");
     std::fs::write(
         &default_cfg_path,
-        "[default]\nhost = \"127.0.0.1\"\nport = 12345\n",
+        "[default]\nhost = \"127.0.0.1\"\nport = 12345\nagent = \"codex\"\n",
     )
     .unwrap();
 
@@ -210,11 +224,13 @@ fn test_config_port_and_host_resolution() {
         CliOutcome::Run(ServerConfig {
             host: "127.0.0.1".parse().unwrap(),
             port: 12345,
+            default_agent: "codex".to_string(),
+            agents: HashMap::new(),
         })
     );
 
     // 3. Also test USER_PROFILE fallback with [default] section
-    std::fs::write(&default_cfg_path, "[default]\nport = 23456\n").unwrap();
+    std::fs::write(&default_cfg_path, "[default]\nport = 23456\nagent = \"gemini\"\n").unwrap();
     let win_env: HashMap<&str, String> =
         HashMap::from([("USER_PROFILE", fake_home.to_string_lossy().into_owned())]);
     let outcome =
@@ -224,6 +240,8 @@ fn test_config_port_and_host_resolution() {
         CliOutcome::Run(ServerConfig {
             host: "0.0.0.0".parse().unwrap(),
             port: 23456,
+            default_agent: "gemini".to_string(),
+            agents: HashMap::new(),
         })
     );
 
@@ -239,11 +257,19 @@ fn test_config_port_and_host_resolution() {
         CliOutcome::Run(ServerConfig {
             host: "0.0.0.0".parse().unwrap(),
             port: 4200,
+            default_agent: "gemini".to_string(),
+            agents: HashMap::new(),
         })
     );
 
     let outcome = ServerConfig::from_args_and_env(
-        ["agent-gateway", "-p", "4300", "--host=127.0.0.1"],
+        [
+            "agent-gateway",
+            "-p",
+            "4300",
+            "--host=127.0.0.1",
+            "--agent=copilot",
+        ],
         |k| env_map.get(k).cloned(),
     )
     .unwrap();
@@ -252,10 +278,82 @@ fn test_config_port_and_host_resolution() {
         CliOutcome::Run(ServerConfig {
             host: "127.0.0.1".parse().unwrap(),
             port: 4300,
+            default_agent: "copilot".to_string(),
+            agents: HashMap::new(),
         })
     );
 
     let _ = std::fs::remove_dir_all(&fake_home);
+}
+
+#[tokio::test]
+async fn test_default_and_explicit_agent_spawn() {
+    use agent_gateway::{AgentProfile, ServerConfig};
+    use std::collections::HashMap;
+
+    let mut agents = HashMap::new();
+    agents.insert(
+        "mock-claude".to_string(),
+        AgentProfile {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo MOCK_CLAUDE_STARTED".to_string()],
+            env: HashMap::new(),
+        },
+    );
+    agents.insert(
+        "mock-codex".to_string(),
+        AgentProfile {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo MOCK_CODEX_STARTED".to_string()],
+            env: HashMap::new(),
+        },
+    );
+
+    let config = ServerConfig {
+        host: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        default_agent: "mock-claude".to_string(),
+        agents,
+    };
+
+    let manager = AgentManager::with_config(&config);
+    let router = app(manager);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Spawn without specifying `agent` -> uses config's default_agent ("mock-claude")
+    let resp = client
+        .post(format!("{base_url}/agents"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let default_spawned: AgentSummary = resp.json().await.unwrap();
+    assert_eq!(default_spawned.agent, "mock-claude");
+
+    // 2. Spawn with explicit `agent: "mock-codex"`
+    let resp = client
+        .post(format!("{base_url}/agents"))
+        .json(&json!({
+            "agent": "mock-codex",
+            "name": "my-codex"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let explicit_spawned: AgentSummary = resp.json().await.unwrap();
+    assert_eq!(explicit_spawned.agent, "mock-codex");
+    assert_eq!(explicit_spawned.name, "my-codex");
 }
 
 

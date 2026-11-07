@@ -28,10 +28,15 @@ async fn main() {
         .init();
 
     let addr = config.socket_addr();
-    let manager = AgentManager::new();
+    let default_agent = config.default_agent.clone();
+    let manager = AgentManager::with_config(&config);
     let router = app(manager);
 
-    tracing::info!("agent-gateway listening on http://{}", addr);
+    tracing::info!(
+        "agent-gateway listening on http://{} (default agent: {})",
+        addr,
+        default_agent
+    );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind TCP listener");
