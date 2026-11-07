@@ -50,6 +50,10 @@ mkdir -p ~/.config/systemd/user
 cp systemd/agent-gateway.service ~/.config/systemd/user/
 
 # 3. ユニットを再読込して自動起動を有効化＆即時起動
+# （※ 非PAM経由のシェル等で $XDG_RUNTIME_DIR / $DBUS_SESSION_BUS_ADDRESS が未定義の場合は以下を付与）
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
 systemctl --user daemon-reload
 systemctl --user enable --now agent-gateway.service
 

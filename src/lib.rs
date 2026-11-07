@@ -5,7 +5,7 @@ use axum::{
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -469,9 +469,6 @@ enum WsServerMessage {
     Status {
         status: AgentStatus,
         exit_code: Option<u32>,
-    },
-    Error {
-        message: String,
     },
 }
 
