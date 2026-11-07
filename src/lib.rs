@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     io::{Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -25,6 +27,226 @@ use uuid::Uuid;
 
 const MAX_IO_RECORDS: usize = 2000;
 const MAX_RAW_BYTES: usize = 1024 * 1024; // 1 MiB per stream buffer
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: IpAddr,
+    #[serde(default = "default_port")]
+    pub port: u16,
+}
+
+fn default_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
+fn default_port() -> u16 {
+    3000
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SectionConfig {
+    host: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    default: SectionConfig,
+    host: Option<IpAddr>,
+    port: Option<u16>,
+}
+
+impl FileConfig {
+    fn resolved_host(&self) -> Option<IpAddr> {
+        self.default.host.or(self.host)
+    }
+
+    fn resolved_port(&self) -> Option<u16> {
+        self.default.port.or(self.port)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliOutcome {
+    Run(ServerConfig),
+    Help(String),
+    Version(String),
+}
+
+impl ServerConfig {
+    pub fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.host, self.port)
+    }
+
+    pub fn usage() -> String {
+        concat!(
+            "Usage: agent-gateway [OPTIONS]\n\n",
+            "Options:\n",
+            "  -p, --port <PORT>      Port number to listen on (default: 3000, env: AGENT_GATEWAY_PORT / PORT)\n",
+            "  -H, --host <HOST>      Host IP to bind (default: 0.0.0.0, env: AGENT_GATEWAY_HOST / HOST)\n",
+            "  -c, --config <PATH>    Path to TOML config file (default: ~/.config/agent-gateway/config.toml on Mac/Linux, %USERPROFILE%\\.config\\agent-gateway\\config.toml on Windows)\n",
+            "  -h, --help             Print help\n",
+            "  -V, --version          Print version\n"
+        )
+        .to_string()
+    }
+
+    pub fn default_config_path(env_lookup: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        let base_dir = if cfg!(windows) {
+            env_lookup("USERPROFILE")
+                .or_else(|| env_lookup("USER_PROFILE"))
+                .or_else(|| env_lookup("HOME"))
+        } else {
+            env_lookup("HOME")
+                .or_else(|| env_lookup("USERPROFILE"))
+                .or_else(|| env_lookup("USER_PROFILE"))
+        }?;
+        Some(
+            PathBuf::from(base_dir)
+                .join(".config")
+                .join("agent-gateway")
+                .join("config.toml"),
+        )
+    }
+
+    pub fn from_args_and_env<I, S>(
+        args: I,
+        env_lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<CliOutcome, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut iter = args.into_iter().map(Into::into);
+        let _program = iter.next();
+
+        let mut cli_port: Option<u16> = None;
+        let mut cli_host: Option<IpAddr> = None;
+        let mut cli_config: Option<PathBuf> = None;
+
+        while let Some(arg) = iter.next() {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(CliOutcome::Help(Self::usage())),
+                "-V" | "--version" => {
+                    return Ok(CliOutcome::Version(format!(
+                        "{} {}",
+                        env!("CARGO_PKG_NAME"),
+                        env!("CARGO_PKG_VERSION")
+                    )))
+                }
+                "-p" | "--port" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --port".to_string())?;
+                    cli_port = Some(
+                        val.parse::<u16>()
+                            .map_err(|_| format!("invalid port number: '{val}'"))?,
+                    );
+                }
+                _ if arg.starts_with("--port=") => {
+                    let val = &arg["--port=".len()..];
+                    cli_port = Some(
+                        val.parse::<u16>()
+                            .map_err(|_| format!("invalid port number: '{val}'"))?,
+                    );
+                }
+                "-H" | "--host" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --host".to_string())?;
+                    cli_host = Some(
+                        val.parse::<IpAddr>()
+                            .map_err(|_| format!("invalid host IP address: '{val}'"))?,
+                    );
+                }
+                _ if arg.starts_with("--host=") => {
+                    let val = &arg["--host=".len()..];
+                    cli_host = Some(
+                        val.parse::<IpAddr>()
+                            .map_err(|_| format!("invalid host IP address: '{val}'"))?,
+                    );
+                }
+                "-c" | "--config" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --config".to_string())?;
+                    cli_config = Some(PathBuf::from(val));
+                }
+                _ if arg.starts_with("--config=") => {
+                    let val = &arg["--config=".len()..];
+                    cli_config = Some(PathBuf::from(val));
+                }
+                other => return Err(format!("unknown option: '{other}'\n\n{}", Self::usage())),
+            }
+        }
+
+        let config_path = cli_config.or_else(|| {
+            env_lookup("AGENT_GATEWAY_CONFIG").map(PathBuf::from)
+        });
+
+        let file_cfg = if let Some(path) = config_path {
+            Self::load_file(&path)?
+        } else {
+            Self::load_default_file(&env_lookup)?
+        };
+
+        let env_port = env_lookup("AGENT_GATEWAY_PORT")
+            .or_else(|| env_lookup("PORT"))
+            .map(|v| {
+                v.parse::<u16>()
+                    .map_err(|_| format!("invalid port in environment variable: '{v}'"))
+            })
+            .transpose()?;
+
+        let env_host = env_lookup("AGENT_GATEWAY_HOST")
+            .or_else(|| env_lookup("HOST"))
+            .map(|v| {
+                v.parse::<IpAddr>()
+                    .map_err(|_| format!("invalid host IP in environment variable: '{v}'"))
+            })
+            .transpose()?;
+
+        let cfg = ServerConfig {
+            host: cli_host
+                .or(env_host)
+                .or_else(|| file_cfg.resolved_host())
+                .unwrap_or_else(default_host),
+            port: cli_port
+                .or(env_port)
+                .or_else(|| file_cfg.resolved_port())
+                .unwrap_or_else(default_port),
+        };
+
+        Ok(CliOutcome::Run(cfg))
+    }
+
+    fn load_file(path: &FsPath) -> Result<FileConfig, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config file '{}': {e}", path.display()))?;
+        toml::from_str(&content)
+            .map_err(|e| format!("failed to parse TOML config file '{}': {e}", path.display()))
+    }
+
+    fn load_default_file(env_lookup: &impl Fn(&str) -> Option<String>) -> Result<FileConfig, String> {
+        if let Some(cfg_path) = Self::default_config_path(env_lookup) {
+            if cfg_path.is_file() {
+                return Self::load_file(&cfg_path);
+            }
+        }
+        Ok(FileConfig::default())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

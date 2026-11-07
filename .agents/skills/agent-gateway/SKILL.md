@@ -20,13 +20,14 @@ Base URL defaults to `GATEWAY_URL="${AGENT_GATEWAY_URL:-http://localhost:3000}"`
 Before calling `/agents` endpoints, check if the gateway is already listening:
 
 ```bash
-curl -sf http://localhost:3000/health
+GATEWAY_URL="${AGENT_GATEWAY_URL:-http://localhost:3000}"
+curl -sf "${GATEWAY_URL}/health"
 ```
 
 - If it returns `{"status":"ok"}`, proceed directly.
-- If it is not running, start the binary in the background from the repository (`/home/kazto/Work/agent-gateway` or `agent-gateway` in `PATH`) and verify readiness via `/health`:
+- If it is not running, check if a custom port is configured in `~/.config/agent-gateway/config.toml` (`%USERPROFILE%\.config\agent-gateway\config.toml` on Windows) under `[default]`, or start the binary in the background from `/home/kazto/Work/agent-gateway` (or `agent-gateway` in `PATH`) and verify readiness via `/health`. Port/host can be customized via `-p <PORT>` / `--port <PORT>`, `--host <HOST>`, `--config <PATH>`, `AGENT_GATEWAY_PORT` / `PORT`, or `config.toml`:
   ```bash
-  cargo run --manifest-path /home/kazto/Work/agent-gateway/Cargo.toml --release
+  cargo run --manifest-path /home/kazto/Work/agent-gateway/Cargo.toml --release -- --port 3000
   ```
 
 ## 2. API Reference & Common Workflows

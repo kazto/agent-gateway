@@ -4,21 +4,60 @@ Rust製の軽量・シングルバイナリなAIエージェント管理ゲー�
 
 ## コンセプト・特徴
 
-- デフォルトで `3000` ポートで待ち受ける（環境変数 `PORT` で変更可能）
+- デフォルトで `3000` ポートで待ち受ける（CLIオプション `-p`/`--port`、環境変数 `AGENT_GATEWAY_PORT`/`PORT`、設定ファイルで変更可能）
 - PTY（擬似端末）対応により、Claude Code・Copilot CLIなどの対話型TUIエージェントもそのまま動作
 - 現在実行中のAIエージェントを一覧できる
 - 任意のAIエージェントの標準入力・標準出力の取得および標準入力への送信（HTTP / WebSocket双方向通信）ができる
 
-## 起動方法
+## 起動方法・設定
 
 ```bash
-# 開発実行（デフォルト: 0.0.0.0:3000）
+# デフォルト起動（0.0.0.0:3000）
 cargo run
 
-# リリースビルド（シングルバイナリ生成）
-cargo build --release
-./target/release/agent-gateway
+# CLIオプションでポート・ホストを指定
+cargo run -- -p 4000 --host 127.0.0.1
+
+# 環境変数で指定
+PORT=4000 ./target/release/agent-gateway
+AGENT_GATEWAY_PORT=4000 AGENT_GATEWAY_HOST=127.0.0.1 ./target/release/agent-gateway
+
+# 設定ファイル（TOML）で指定
+# --config未指定時は以下のパスを自動読込:
+#   - Mac / Linux: ~/.config/agent-gateway/config.toml
+#   - Windows:     %USERPROFILE%\.config\agent-gateway\config.toml (%USER_PROFILE% も対応)
+./target/release/agent-gateway --config ~/.config/agent-gateway/config.toml
 ```
+
+設定ファイル例 (`config.toml`):
+```toml
+[default]
+port = 12345
+host = "127.0.0.1"
+```
+優先順位は **CLIオプション (`-p`/`--port`, `-H`/`--host`) > 環境変数 (`AGENT_GATEWAY_PORT`/`PORT`) > 設定ファイル (`config.toml`) > デフォルト (`0.0.0.0:3000`)** です。
+
+## systemd によるログイン時自動起動 (`systemctl --user`)
+
+`systemd/agent-gateway.service` を使って、ユーザーログイン時に自動起動させることができます。
+
+```bash
+# 1. バイナリを ~/.cargo/bin/agent-gateway にインストール
+cargo install --path .
+
+# 2. ユーザー用 systemd ディレクトリへユニットファイルを配置
+mkdir -p ~/.config/systemd/user
+cp systemd/agent-gateway.service ~/.config/systemd/user/
+
+# 3. ユニットを再読込して自動起動を有効化＆即時起動
+systemctl --user daemon-reload
+systemctl --user enable --now agent-gateway.service
+
+# 4. ステータスとログの確認
+systemctl --user status agent-gateway.service
+journalctl --user -u agent-gateway.service -f
+```
+（※ ポート番号などを変更したい場合は、`~/.config/agent-gateway/config.toml` に記載することでサービス再起動時に自動で反映されます）
 
 ## API エンドポイント
 

@@ -175,3 +175,87 @@ async fn test_websocket_bidirectional_io() {
         .await;
 }
 
+#[test]
+fn test_config_port_and_host_resolution() {
+    use agent_gateway::{CliOutcome, ServerConfig};
+    use std::collections::HashMap;
+
+    // 1. Default values (0.0.0.0:3000) when no HOME/USER_PROFILE has a config
+    let outcome = ServerConfig::from_args_and_env(["agent-gateway"], |_| None).unwrap();
+    assert_eq!(
+        outcome,
+        CliOutcome::Run(ServerConfig {
+            host: "0.0.0.0".parse().unwrap(),
+            port: 3000,
+        })
+    );
+
+    // 2. Default config directory (~/.config/agent-gateway/config.toml or %USER_PROFILE%\.config\agent-gateway\config.toml)
+    let fake_home = std::env::temp_dir().join(format!("agent-gw-home-{}", uuid::Uuid::new_v4()));
+    let cfg_dir = fake_home.join(".config").join("agent-gateway");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let default_cfg_path = cfg_dir.join("config.toml");
+    std::fs::write(
+        &default_cfg_path,
+        "[default]\nhost = \"127.0.0.1\"\nport = 12345\n",
+    )
+    .unwrap();
+
+    let home_env: HashMap<&str, String> =
+        HashMap::from([("HOME", fake_home.to_string_lossy().into_owned())]);
+    let outcome =
+        ServerConfig::from_args_and_env(["agent-gateway"], |k| home_env.get(k).cloned()).unwrap();
+    assert_eq!(
+        outcome,
+        CliOutcome::Run(ServerConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 12345,
+        })
+    );
+
+    // 3. Also test USER_PROFILE fallback with [default] section
+    std::fs::write(&default_cfg_path, "[default]\nport = 23456\n").unwrap();
+    let win_env: HashMap<&str, String> =
+        HashMap::from([("USER_PROFILE", fake_home.to_string_lossy().into_owned())]);
+    let outcome =
+        ServerConfig::from_args_and_env(["agent-gateway"], |k| win_env.get(k).cloned()).unwrap();
+    assert_eq!(
+        outcome,
+        CliOutcome::Run(ServerConfig {
+            host: "0.0.0.0".parse().unwrap(),
+            port: 23456,
+        })
+    );
+
+    // 4. Env overrides config file, CLI overrides both
+    let env_map: HashMap<&str, String> = HashMap::from([
+        ("HOME", fake_home.to_string_lossy().into_owned()),
+        ("PORT", "4200".to_string()),
+    ]);
+    let outcome =
+        ServerConfig::from_args_and_env(["agent-gateway"], |k| env_map.get(k).cloned()).unwrap();
+    assert_eq!(
+        outcome,
+        CliOutcome::Run(ServerConfig {
+            host: "0.0.0.0".parse().unwrap(),
+            port: 4200,
+        })
+    );
+
+    let outcome = ServerConfig::from_args_and_env(
+        ["agent-gateway", "-p", "4300", "--host=127.0.0.1"],
+        |k| env_map.get(k).cloned(),
+    )
+    .unwrap();
+    assert_eq!(
+        outcome,
+        CliOutcome::Run(ServerConfig {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 4300,
+        })
+    );
+
+    let _ = std::fs::remove_dir_all(&fake_home);
+}
+
+
