@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 #[tokio::test]
 async fn test_agent_lifecycle_and_io() {
     let manager = AgentManager::new();
+    let token = manager.token().to_string();
     let router = app(manager);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -22,6 +23,7 @@ async fn test_agent_lifecycle_and_io() {
     // 1. Spawn an interactive sh agent
     let resp = client
         .post(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .json(&json!({
             "name": "test-agent",
             "command": "sh",
@@ -38,6 +40,7 @@ async fn test_agent_lifecycle_and_io() {
     // 2. List running agents
     let list: Vec<AgentSummary> = client
         .get(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -50,6 +53,7 @@ async fn test_agent_lifecycle_and_io() {
     // 3. Send stdin to the agent
     let input_resp = client
         .post(format!("{base_url}/agents/{}/input", created.id))
+        .bearer_auth(&token)
         .json(&json!({ "data": "hello-gateway\n" }))
         .send()
         .await
@@ -64,6 +68,7 @@ async fn test_agent_lifecycle_and_io() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let current: AgentIoResponse = client
             .get(format!("{base_url}/agents/{}/io", created.id))
+            .bearer_auth(&token)
             .send()
             .await
             .unwrap()
@@ -84,6 +89,7 @@ async fn test_agent_lifecycle_and_io() {
     // Verify GET /agents/:id/screen endpoint
     let screen_resp: agent_gateway::AgentScreenResponse = client
         .get(format!("{base_url}/agents/{}/screen", created.id))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -95,6 +101,7 @@ async fn test_agent_lifecycle_and_io() {
     // 4. Resize PTY
     let resize_resp = client
         .post(format!("{base_url}/agents/{}/resize", created.id))
+        .bearer_auth(&token)
         .json(&json!({ "rows": 40, "cols": 120 }))
         .send()
         .await
@@ -107,6 +114,7 @@ async fn test_agent_lifecycle_and_io() {
     // 5. Stop agent
     let del_resp = client
         .delete(format!("{base_url}/agents/{}", created.id))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();
@@ -117,6 +125,7 @@ async fn test_agent_lifecycle_and_io() {
     // Running list should now be empty
     let running_list: Vec<AgentSummary> = client
         .get(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -132,6 +141,7 @@ async fn test_websocket_bidirectional_io() {
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     let manager = AgentManager::new();
+    let token = manager.token().to_string();
     let router = app(manager);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -145,6 +155,7 @@ async fn test_websocket_bidirectional_io() {
     let client = reqwest::Client::new();
     let created: AgentSummary = client
         .post(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .json(&json!({
             "name": "ws-agent",
             "command": "sh",
@@ -157,7 +168,7 @@ async fn test_websocket_bidirectional_io() {
         .await
         .unwrap();
 
-    let ws_url = format!("ws://{addr}/agents/{}/ws", created.id);
+    let ws_url = format!("ws://{addr}/agents/{}/ws?token={token}", created.id);
     let (mut ws_stream, _) = connect_async(ws_url).await.unwrap();
 
     // Send input via JSON command over WebSocket
@@ -183,6 +194,7 @@ async fn test_websocket_bidirectional_io() {
 
     let _ = client
         .delete(format!("{base_url}/agents/{}", created.id))
+        .bearer_auth(&token)
         .send()
         .await;
 }
@@ -200,6 +212,7 @@ fn test_config_port_and_host_resolution() {
             host: "0.0.0.0".parse().unwrap(),
             port: 3000,
             default_agent: "claude".to_string(),
+            token: None,
             agents: HashMap::new(),
         })
     );
@@ -211,7 +224,7 @@ fn test_config_port_and_host_resolution() {
     let default_cfg_path = cfg_dir.join("config.toml");
     std::fs::write(
         &default_cfg_path,
-        "[default]\nhost = \"127.0.0.1\"\nport = 12345\nagent = \"codex\"\n",
+        "[default]\nhost = \"127.0.0.1\"\nport = 12345\nagent = \"codex\"\ntoken = \"cfg-secret\"\n",
     )
     .unwrap();
 
@@ -225,6 +238,7 @@ fn test_config_port_and_host_resolution() {
             host: "127.0.0.1".parse().unwrap(),
             port: 12345,
             default_agent: "codex".to_string(),
+            token: Some("cfg-secret".to_string()),
             agents: HashMap::new(),
         })
     );
@@ -241,6 +255,7 @@ fn test_config_port_and_host_resolution() {
             host: "0.0.0.0".parse().unwrap(),
             port: 23456,
             default_agent: "gemini".to_string(),
+            token: None,
             agents: HashMap::new(),
         })
     );
@@ -249,6 +264,7 @@ fn test_config_port_and_host_resolution() {
     let env_map: HashMap<&str, String> = HashMap::from([
         ("HOME", fake_home.to_string_lossy().into_owned()),
         ("PORT", "4200".to_string()),
+        ("AGENT_GATEWAY_TOKEN", "env-secret".to_string()),
     ]);
     let outcome =
         ServerConfig::from_args_and_env(["agent-gateway"], |k| env_map.get(k).cloned()).unwrap();
@@ -258,6 +274,7 @@ fn test_config_port_and_host_resolution() {
             host: "0.0.0.0".parse().unwrap(),
             port: 4200,
             default_agent: "gemini".to_string(),
+            token: Some("env-secret".to_string()),
             agents: HashMap::new(),
         })
     );
@@ -269,6 +286,7 @@ fn test_config_port_and_host_resolution() {
             "4300",
             "--host=127.0.0.1",
             "--agent=copilot",
+            "--token=cli-secret",
         ],
         |k| env_map.get(k).cloned(),
     )
@@ -279,6 +297,7 @@ fn test_config_port_and_host_resolution() {
             host: "127.0.0.1".parse().unwrap(),
             port: 4300,
             default_agent: "copilot".to_string(),
+            token: Some("cli-secret".to_string()),
             agents: HashMap::new(),
         })
     );
@@ -313,10 +332,12 @@ async fn test_default_and_explicit_agent_spawn() {
         host: "127.0.0.1".parse().unwrap(),
         port: 0,
         default_agent: "mock-claude".to_string(),
+        token: Some("test-token-123".to_string()),
         agents,
     };
 
     let manager = AgentManager::with_config(&config);
+    let token = manager.token().to_string();
     let router = app(manager);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -332,6 +353,7 @@ async fn test_default_and_explicit_agent_spawn() {
     // 1. Spawn without specifying `agent` -> uses config's default_agent ("mock-claude")
     let resp = client
         .post(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .json(&json!({}))
         .send()
         .await
@@ -343,6 +365,7 @@ async fn test_default_and_explicit_agent_spawn() {
     // 2. Spawn with explicit `agent: "mock-codex"`
     let resp = client
         .post(format!("{base_url}/agents"))
+        .bearer_auth(&token)
         .json(&json!({
             "agent": "mock-codex",
             "name": "my-codex"
@@ -354,6 +377,68 @@ async fn test_default_and_explicit_agent_spawn() {
     let explicit_spawned: AgentSummary = resp.json().await.unwrap();
     assert_eq!(explicit_spawned.agent, "mock-codex");
     assert_eq!(explicit_spawned.name, "my-codex");
+}
+
+#[tokio::test]
+async fn test_authentication_enforcement() {
+    use tokio_tungstenite::connect_async;
+
+    let manager = AgentManager::new();
+    let token = manager.token().to_string();
+    assert!(token.len() >= 32, "auto-generated token should be strong");
+    let router = app(manager);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. GET /health is public (no token required)
+    let health_resp = client.get(format!("{base_url}/health")).send().await.unwrap();
+    assert_eq!(health_resp.status(), StatusCode::OK);
+
+    // 2. GET /agents without token -> 401 Unauthorized
+    let no_auth_resp = client.get(format!("{base_url}/agents")).send().await.unwrap();
+    assert_eq!(no_auth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. GET /agents with wrong Bearer token -> 401 Unauthorized
+    let bad_auth_resp = client
+        .get(format!("{base_url}/agents"))
+        .bearer_auth("wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_auth_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. GET /agents with X-API-Key header -> 200 OK
+    let api_key_resp = client
+        .get(format!("{base_url}/agents"))
+        .header("X-API-Key", &token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(api_key_resp.status(), StatusCode::OK);
+
+    // 5. GET /agents with ?token= query parameter -> 200 OK
+    let query_resp = client
+        .get(format!("{base_url}/agents?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(query_resp.status(), StatusCode::OK);
+
+    // 6. WebSocket without token -> fails with 401
+    let ws_unauth = connect_async(format!(
+        "ws://{addr}/agents/{}/ws",
+        uuid::Uuid::new_v4()
+    ))
+    .await;
+    assert!(ws_unauth.is_err());
 }
 
 

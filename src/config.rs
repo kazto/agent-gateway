@@ -23,6 +23,8 @@ pub struct ServerConfig {
     #[serde(default = "default_agent_name")]
     pub default_agent: String,
     #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
     pub agents: HashMap<String, AgentProfile>,
 }
 
@@ -38,12 +40,21 @@ pub(crate) fn default_agent_name() -> String {
     "claude".to_string()
 }
 
+pub fn generate_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: default_host(),
             port: default_port(),
             default_agent: default_agent_name(),
+            token: None,
             agents: HashMap::new(),
         }
     }
@@ -54,6 +65,7 @@ struct SectionConfig {
     host: Option<IpAddr>,
     port: Option<u16>,
     agent: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -63,6 +75,7 @@ struct FileConfig {
     host: Option<IpAddr>,
     port: Option<u16>,
     agent: Option<String>,
+    token: Option<String>,
     #[serde(default)]
     agents: HashMap<String, AgentProfile>,
 }
@@ -78,6 +91,15 @@ impl FileConfig {
 
     fn resolved_agent(&self) -> Option<String> {
         self.default.agent.clone().or_else(|| self.agent.clone())
+    }
+
+    fn resolved_token(&self) -> Option<String> {
+        self.default
+            .token
+            .clone()
+            .or_else(|| self.token.clone())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
     }
 }
 
@@ -100,6 +122,7 @@ impl ServerConfig {
             "  -p, --port <PORT>      Port number to listen on (default: 3000, env: AGENT_GATEWAY_PORT / PORT)\n",
             "  -H, --host <HOST>      Host IP to bind (default: 0.0.0.0, env: AGENT_GATEWAY_HOST / HOST)\n",
             "  -a, --agent <AGENT>    Default agent name/command (default: claude, env: AGENT_GATEWAY_DEFAULT_AGENT)\n",
+            "  -t, --token <TOKEN>    Auth token (env: AGENT_GATEWAY_TOKEN; auto-generated if omitted)\n",
             "  -c, --config <PATH>    Path to TOML config file (default: ~/.config/agent-gateway/config.toml on Mac/Linux, %USERPROFILE%\\.config\\agent-gateway\\config.toml on Windows)\n",
             "  -h, --help             Print help\n",
             "  -V, --version          Print version\n"
@@ -125,6 +148,35 @@ impl ServerConfig {
         )
     }
 
+    pub fn default_token_path(env_lookup: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        Self::default_config_path(env_lookup).map(|p| p.with_file_name("token"))
+    }
+
+    pub fn write_token_file(path: &FsPath, token: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create directory '{}' for token file: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(path, format!("{token}\n"))
+            .map_err(|e| format!("failed to write token file '{}': {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                format!(
+                    "failed to set 0600 permissions on token file '{}': {e}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn from_args_and_env<I, S>(
         args: I,
         env_lookup: impl Fn(&str) -> Option<String>,
@@ -139,6 +191,7 @@ impl ServerConfig {
         let mut cli_port: Option<u16> = None;
         let mut cli_host: Option<IpAddr> = None;
         let mut cli_agent: Option<String> = None;
+        let mut cli_token: Option<String> = None;
         let mut cli_config: Option<PathBuf> = None;
 
         while let Some(arg) = iter.next() {
@@ -193,6 +246,23 @@ impl ServerConfig {
                     let val = &arg["--agent=".len()..];
                     cli_agent = Some(val.to_string());
                 }
+                "-t" | "--token" => {
+                    let val = iter
+                        .next()
+                        .ok_or_else(|| "missing value for --token".to_string())?;
+                    let trimmed = val.trim().to_string();
+                    if trimmed.is_empty() {
+                        return Err("--token must not be empty".to_string());
+                    }
+                    cli_token = Some(trimmed);
+                }
+                _ if arg.starts_with("--token=") => {
+                    let val = arg["--token=".len()..].trim().to_string();
+                    if val.is_empty() {
+                        return Err("--token must not be empty".to_string());
+                    }
+                    cli_token = Some(val);
+                }
                 "-c" | "--config" => {
                     let val = iter
                         .next()
@@ -236,6 +306,10 @@ impl ServerConfig {
         let env_agent = env_lookup("AGENT_GATEWAY_DEFAULT_AGENT")
             .or_else(|| env_lookup("AGENT_GATEWAY_AGENT"));
 
+        let env_token = env_lookup("AGENT_GATEWAY_TOKEN")
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+
         let cfg = ServerConfig {
             host: cli_host
                 .or(env_host)
@@ -249,6 +323,9 @@ impl ServerConfig {
                 .or(env_agent)
                 .or_else(|| file_cfg.resolved_agent())
                 .unwrap_or_else(default_agent_name),
+            token: cli_token
+                .or(env_token)
+                .or_else(|| file_cfg.resolved_token()),
             agents: file_cfg.agents,
         };
 

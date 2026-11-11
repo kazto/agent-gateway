@@ -5,7 +5,7 @@ pub mod models;
 pub mod session;
 
 pub use api::app;
-pub use config::{AgentProfile, CliOutcome, ServerConfig};
+pub use config::{generate_token, AgentProfile, CliOutcome, ServerConfig};
 pub use manager::AgentManager;
 pub use models::{
     AgentIoResponse, AgentScreenResponse, AgentStatus, AgentSummary, IoQuery, IoRecord,

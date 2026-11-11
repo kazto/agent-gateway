@@ -9,9 +9,10 @@ use crate::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        Path, Query, Request, State,
     },
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -23,8 +24,7 @@ use std::sync::{atomic::Ordering, Arc};
 use uuid::Uuid;
 
 pub fn app(manager: AgentManager) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/agents", get(list_agents).post(spawn_agent))
         .route("/agents/:id", get(get_agent).delete(stop_agent))
         .route("/agents/:id/stop", post(stop_agent))
@@ -33,7 +33,78 @@ pub fn app(manager: AgentManager) -> Router {
         .route("/agents/:id/input", post(send_agent_input))
         .route("/agents/:id/resize", post(resize_agent_pty))
         .route("/agents/:id/ws", get(ws_agent))
+        .route_layer(middleware::from_fn_with_state(
+            manager.clone(),
+            require_auth,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(manager)
+}
+
+async fn require_auth(
+    State(manager): State<AgentManager>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let expected = manager.token();
+    if let Some(provided) = extract_token(req.headers(), req.uri().query()) {
+        if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+            return next.run(req).await;
+        }
+    }
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized: valid Bearer token or X-API-Key required",
+    )
+}
+
+fn extract_token<'a>(headers: &'a HeaderMap, query: Option<&'a str>) -> Option<&'a str> {
+    if let Some(auth_val) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        let trimmed = auth_val.trim();
+        if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+            let token = trimmed[7..].trim();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+
+    if let Some(api_key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let token = api_key.trim();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some(val) = pair.strip_prefix("token=") {
+                let token = val.trim();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[derive(Serialize)]

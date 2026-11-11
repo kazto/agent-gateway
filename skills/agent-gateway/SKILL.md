@@ -15,17 +15,19 @@ description: >
 
 Base URL defaults to `GATEWAY_URL="${AGENT_GATEWAY_URL:-http://localhost:3000}"`.
 
-## 1. Pre-flight: Check or start the gateway
+## 1. Pre-flight: Check or start the gateway & load Auth Token
 
-Before calling `/agents` endpoints, check if the gateway is already listening:
+All endpoints except `GET /health` require authentication via `Authorization: Bearer <TOKEN>`, `X-API-Key: <TOKEN>`, or `?token=<TOKEN>`.
+When `agent-gateway` starts, it writes the active token (either configured in `config.toml` / `AGENT_GATEWAY_TOKEN` / `--token`, or randomly generated on startup) to `~/.config/agent-gateway/token` (`0600` permissions).
 
 ```bash
 GATEWAY_URL="${AGENT_GATEWAY_URL:-http://localhost:3000}"
+GATEWAY_TOKEN="${AGENT_GATEWAY_TOKEN:-$(tr -d '\r\n' < ~/.config/agent-gateway/token 2>/dev/null)}"
 curl -sf "${GATEWAY_URL}/health"
 ```
 
-- If it returns `{"status":"ok"}`, proceed directly.
-- If it is not running, check if a custom port is configured in `~/.config/agent-gateway/config.toml` (`%USERPROFILE%\.config\agent-gateway\config.toml` on Windows) under `[default]`, or start the binary in the background from `/home/kazto/Work/agent-gateway` (or `agent-gateway` in `PATH`) and verify readiness via `/health`. Port/host can be customized via `-p <PORT>` / `--port <PORT>`, `--host <HOST>`, `--config <PATH>`, `AGENT_GATEWAY_PORT` / `PORT`, or `config.toml`:
+- If `/health` returns `{"status":"ok"}`, proceed directly and pass `-H "Authorization: Bearer ${GATEWAY_TOKEN}"` on all `/agents` calls.
+- If it is not running, check if a custom port is configured in `~/.config/agent-gateway/config.toml` (`%USERPROFILE%\.config\agent-gateway\config.toml` on Windows) under `[default]`, or start the binary in the background from `/home/kazto/Work/agent-gateway` (or `agent-gateway` in `PATH`) and verify readiness via `/health`. Port/host/token can be customized via `-p <PORT>` / `--port <PORT>`, `--host <HOST>`, `-t <TOKEN>` / `--token <TOKEN>`, `--config <PATH>`, `AGENT_GATEWAY_PORT` / `PORT`, `AGENT_GATEWAY_TOKEN`, or `config.toml`:
   ```bash
   cargo run --manifest-path /home/kazto/Work/agent-gateway/Cargo.toml --release -- --port 3000
   ```
@@ -38,10 +40,10 @@ By default, `GET /agents` returns only `running` agents. Pass `?status=all` or `
 
 ```bash
 # Running agents only
-curl -s http://localhost:3000/agents | jq .
+curl -s -H "Authorization: Bearer ${GATEWAY_TOKEN}" "${GATEWAY_URL}/agents" | jq .
 
 # All agents (running + exited)
-curl -s "http://localhost:3000/agents?status=all" | jq .
+curl -s -H "Authorization: Bearer ${GATEWAY_TOKEN}" "${GATEWAY_URL}/agents?status=all" | jq .
 ```
 
 Each entry contains `id` (UUID), `name`, `command`, `args`, `cwd`, `pid`, `status` (`running` | `exited`), `exit_code`, `rows`, `cols`, `created_at`, and `exited_at`.
@@ -53,6 +55,7 @@ Pass `"agent"` (`"claude"`, `"codex"`, `"copilot"`, `"gemini"`, etc.) to explici
 ```bash
 # Spawn using the default agent configured in config.toml
 curl -s -X POST "${GATEWAY_URL}/agents" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "default-worker",
@@ -61,6 +64,7 @@ curl -s -X POST "${GATEWAY_URL}/agents" \
 
 # Explicitly specify the agent to launch
 curl -s -X POST "${GATEWAY_URL}/agents" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "agent": "codex",
@@ -80,7 +84,7 @@ Save the returned `.id` (UUID) for subsequent operations.
 Because interactive TUIs (Claude Code, Copilot CLI, Codex, Gemini CLI) emit tens of kilobytes of raw ANSI cursor/color codes, **always prefer `GET /agents/:id/screen`** to inspect what is currently displayed on the terminal screen. It uses a `vt100` virtual terminal emulator to return clean, ANSI-free plain text and cursor coordinates:
 
 ```bash
-curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/screen" | jq -r '.screen'
+curl -s -H "Authorization: Bearer ${GATEWAY_TOKEN}" "${GATEWAY_URL}/agents/${AGENT_ID}/screen" | jq -r '.screen'
 ```
 
 ### Read raw `stdin` and `stdout` history (`GET /agents/:id/io`)
@@ -89,10 +93,10 @@ Returns `.screen` (rendered screen), cumulative raw buffers (`stdin`, `stdout`),
 
 ```bash
 # Read only new stdout chunks since a known sequence number
-curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/io?stream=stdout&since_seq=${LAST_SEQ}" | jq .
+curl -s -H "Authorization: Bearer ${GATEWAY_TOKEN}" "${GATEWAY_URL}/agents/${AGENT_ID}/io?stream=stdout&since_seq=${LAST_SEQ}" | jq .
 
 # Read only the latest 20 records
-curl -s "${GATEWAY_URL}/agents/${AGENT_ID}/io?limit=20" | jq .
+curl -s -H "Authorization: Bearer ${GATEWAY_TOKEN}" "${GATEWAY_URL}/agents/${AGENT_ID}/io?limit=20" | jq .
 ```
 
 ### Send input to `stdin` (`POST /agents/:id/input`)
@@ -102,6 +106,7 @@ Writes raw text/control sequences to the agent's PTY master.
 ```bash
 # Send a prompt + Enter (\r)
 curl -s -X POST "${GATEWAY_URL}/agents/${AGENT_ID}/input" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"data": "Please review src/lib.rs\r"}' | jq .
 ```
@@ -133,7 +138,8 @@ After spawning an agent (`POST /agents`) or sending a prompt (`POST /agents/:id/
 If TUI output wraps narrowly or clips, resize the PTY before reading:
 
 ```bash
-curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/resize" \
+curl -s -X POST "${GATEWAY_URL}/agents/${AGENT_ID}/resize" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"rows": 45, "cols": 140}' | jq .
 ```
@@ -143,12 +149,13 @@ curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/resize" \
 Terminates the process and marks its status as `exited`:
 
 ```bash
-curl -s -X POST "http://localhost:3000/agents/${AGENT_ID}/stop" | jq .
+curl -s -X POST "${GATEWAY_URL}/agents/${AGENT_ID}/stop" \
+  -H "Authorization: Bearer ${GATEWAY_TOKEN}" | jq .
 ```
 
 ### Real-time WebSocket stream (`GET /agents/:id/ws`)
 
-Connect to `ws://localhost:3000/agents/<id>/ws`:
+Connect to `ws://localhost:3000/agents/<id>/ws?token=${GATEWAY_TOKEN}` (or pass `Authorization: Bearer ${GATEWAY_TOKEN}`):
 - On connect, the server replays buffered `{"type":"io","seq":...,"stream":"stdout|stdin","data":"..."}` messages followed by `{"type":"status","status":"running|exited","exit_code":...}`, then streams live `io` events.
 - Send `{"type":"input","data":"...\n"}` (or raw text/binary frames) to write to `stdin`, or `{"type":"resize","rows":40,"cols":120}` to resize.
 

@@ -1,5 +1,5 @@
 use crate::{
-    config::{default_agent_name, AgentProfile, ServerConfig},
+    config::{default_agent_name, generate_token, AgentProfile, ServerConfig},
     models::{AgentStatus, AgentSummary, SpawnAgentRequest, StreamKind},
     session::{AgentSession, IoBuffer},
 };
@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub struct AgentManager {
     sessions: Arc<RwLock<HashMap<Uuid, Arc<AgentSession>>>>,
     default_agent: String,
+    token: Arc<String>,
     agent_profiles: Arc<HashMap<String, AgentProfile>>,
 }
 
@@ -32,20 +33,33 @@ impl AgentManager {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_agent: default_agent_name(),
+            token: Arc::new(generate_token()),
             agent_profiles: Arc::new(HashMap::new()),
         }
     }
 
     pub fn with_config(config: &ServerConfig) -> Self {
+        let token = config
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(generate_token);
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             default_agent: config.default_agent.clone(),
+            token: Arc::new(token),
             agent_profiles: Arc::new(config.agents.clone()),
         }
     }
 
     pub fn default_agent(&self) -> &str {
         &self.default_agent
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     fn resolve_agent_spec(

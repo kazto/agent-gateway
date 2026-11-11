@@ -29,7 +29,37 @@ async fn main() {
 
     let addr = config.socket_addr();
     let default_agent = config.default_agent.clone();
+    let token_was_configured = config.token.is_some();
     let manager = AgentManager::with_config(&config);
+    let active_token = manager.token().to_string();
+
+    if let Some(token_path) = ServerConfig::default_token_path(&|k| std::env::var(k).ok()) {
+        match ServerConfig::write_token_file(&token_path, &active_token) {
+            Ok(()) => {
+                if token_was_configured {
+                    tracing::info!(
+                        "auth token loaded from config/env/CLI and written to {}",
+                        token_path.display()
+                    );
+                } else {
+                    tracing::info!(
+                        "generated random auth token: {} (saved to {})",
+                        active_token,
+                        token_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!("{err}");
+                if !token_was_configured {
+                    tracing::info!("generated random auth token: {}", active_token);
+                }
+            }
+        }
+    } else if !token_was_configured {
+        tracing::info!("generated random auth token: {}", active_token);
+    }
+
     let router = app(manager);
 
     tracing::info!(
